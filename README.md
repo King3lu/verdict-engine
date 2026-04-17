@@ -1,6 +1,11 @@
 # verdict-engine
 
-Open-source multi-source truth verification engine. Searches peer-reviewed databases and government sources, scores study quality, and synthesizes research verdicts using Claude AI.
+> Open-source peer-reviewed fact-checking engine. Give it a claim, get back a research-backed verdict scored 0–100.
+
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+
+---
 
 ## Install
 
@@ -8,13 +13,7 @@ Open-source multi-source truth verification engine. Searches peer-reviewed datab
 pip install verdict-engine
 ```
 
-Or from source:
-
-```bash
-git clone https://github.com/king3lu/verdict-engine.git
-cd verdict-engine
-pip install -e .
-```
+---
 
 ## Quick Start
 
@@ -22,110 +21,171 @@ pip install -e .
 import os
 from verdict_engine import run_verdict_pipeline
 
-os.environ["ANTHROPIC_API_KEY"] = "your-key"
+os.environ["ANTHROPIC_API_KEY"] = "sk-ant-..."
 
 result = run_verdict_pipeline("Vitamin D reduces COVID-19 severity")
-
-print(f"Score: {result.verdict_score}/100")
-print(f"Category: {result.verdict_category}")
-print(f"Summary: {result.research_summary}")
-print(f"Studies: {result.studies_included_count}")
+print(f"{result.verdict_score}/100 — {result.verdict_category}")
+print(result.research_summary)
 ```
+
+That's it. It searches PubMed, Europe PMC, Cochrane, arXiv, WHO, CDC, and NIH in parallel, scores each paper on a transparent 6-dimension rubric, runs two independent Claude passes (synthesis + audit), and returns a structured verdict with sources.
+
+---
+
+## Architecture
+
+```
+verdict_engine/
+│
+├── pipeline.py              # Orchestrates the full pipeline
+│
+├── models.py                # Core data structures
+│   └── VerdictResult, ResearchPaper, ResearchBundle, QualityScore
+│
+├── research/
+│   ├── multi_source.py      # Parallel search: PubMed, Europe PMC, Cochrane, arXiv
+│   ├── government_sources.py  # WHO, CDC, NIH
+│   └── expert_consensus.py    # Expert aggregation (extensible)
+│
+├── synthesis/
+│   ├── claude_service.py    # Claude Sonnet: primary synthesis
+│   │                          Claude Haiku: independent audit/validation
+│   └── verdict_scorer.py    # Transparent 6-dimension quality rubric
+│
+└── analysis/
+    ├── bias_detector.py     # Media framing bias (AllSides/Ad Fontes lean labels)
+    ├── source_quality.py    # Quality constants + helpers
+    └── content_analyzer.py  # Claude Vision (images) + Gemini Files API (video)
+```
+
+### Pipeline Flow
+
+```
+Claim text
+    │
+    ▼
+[1] Parallel research search (7 sources, ThreadPoolExecutor)
+    ├── PubMed (NCBI)
+    ├── Europe PMC
+    ├── Cochrane Reviews
+    ├── arXiv (preprints)
+    ├── WHO
+    ├── CDC
+    └── NIH Reporter
+    │
+    ▼
+[2] Deduplicate by DOI → PMID
+    │
+    ▼
+[3] Quality score each paper (6 dimensions, transparent weights)
+    ├── Study design ×0.30  (meta-analysis > RCT > cohort > observational)
+    ├── Sample size  ×0.20
+    ├── Methodology  ×0.20  (blinded, pre-registered, controls)
+    ├── Journal tier ×0.15  (Nature/Lancet/NEJM = top tier)
+    ├── Replication  ×0.10
+    └── Funding transparency ×0.05
+    │
+    ▼
+[4] Claude Sonnet — primary synthesis → structured JSON verdict
+    │
+    ▼
+[5] Claude Haiku — independent audit → score adjustment + corrections
+    │
+    ▼
+[6] Blend: 60% algorithm score + 40% Claude score → final verdict
+    │
+    ▼
+VerdictResult (score, category, summary, sources, bias analysis)
+```
+
+---
+
+## Verdict Score
+
+| Score | Meaning |
+|---|---|
+| 90–100 | Overwhelming consensus across meta-analyses |
+| 70–89 | Strong consensus with minor caveats |
+| 50–69 | Mixed evidence or emerging field |
+| 30–49 | Contradicted by majority of research |
+| 0–29 | False or clearly misleading |
+
+---
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Yes | Claude API key for synthesis and validation |
+| `ANTHROPIC_API_KEY` | Yes | Claude API key (synthesis + validation) |
 | `GEMINI_API_KEY` | Optional | Google Gemini for video content analysis |
-| `NCBI_API_KEY` | Optional | NCBI API key (increases PubMed rate limit) |
-| `NCBI_EMAIL` | Optional | Email for NCBI requests |
+| `NCBI_API_KEY` | Optional | Increases PubMed rate limit |
+| `NCBI_EMAIL` | Optional | Email for NCBI API requests |
 
-## What It Does
+---
 
-### 1. Multi-Source Research (`verdict_engine.research`)
+## Module Reference
 
-Searches 7 sources in parallel:
-- **PubMed** — NCBI's biomedical literature database
-- **Europe PMC** — European PubMed Central
-- **Cochrane** — Systematic reviews and meta-analyses
-- **arXiv** — Preprints (science, medicine, CS)
-- **WHO** — World Health Organization positions
-- **CDC** — Centers for Disease Control
-- **NIH** — National Institutes of Health grants
+### Research
 
 ```python
 from verdict_engine.research.multi_source import search_all_sources
 
 bundle = search_all_sources("ivermectin COVID treatment")
-print(f"Found {bundle.total_count} papers from {bundle.source_counts}")
+# bundle.papers          → List[ResearchPaper]
+# bundle.government_positions → List[dict]  (WHO/CDC/NIH)
+# bundle.source_counts   → {"pubmed": 12, "europe_pmc": 8, ...}
+# bundle.total_count     → int
 ```
 
-### 2. Study Quality Scoring (`verdict_engine.synthesis.verdict_scorer`)
-
-Transparent 6-dimension rubric — fully auditable:
-
-| Dimension | Weight | Max Score |
-|---|---|---|
-| Study design | 30% | 120 (meta-analyses get bonus) |
-| Sample size | 20% | 100 |
-| Methodology | 20% | 100 |
-| Journal tier | 15% | 100 |
-| Replication | 10% | 100 |
-| Funding transparency | 5% | 100 |
+### Quality Scoring
 
 ```python
 from verdict_engine.synthesis.verdict_scorer import score_study
 
 score = score_study(
-    study_type="meta_analysis",
+    study_type="meta_analysis",   # meta_analysis|rct|cohort|observational|preprint
     journal="The Lancet",
     sample_size=50_000,
     blinded=True,
     pre_registered=True,
     funding_disclosed=True,
 )
-print(score.total_quality_score)  # 0-100
-print(score.breakdown)
+print(score.total_quality_score)  # 0–100
+print(score.breakdown)            # per-dimension scores + weights
 ```
 
-### 3. Claude Synthesis (`verdict_engine.synthesis.claude_service`)
-
-Two-pass AI verification:
-1. **Primary synthesis** — Claude Sonnet synthesizes research into structured verdict
-2. **Independent validation** — Claude Haiku audits the primary verdict for accuracy
-
-```python
-from verdict_engine.synthesis.claude_service import synthesize_verdict, validate_verdict
-
-verdict = synthesize_verdict(claim, papers)
-audit = validate_verdict(claim, verdict, papers)
-```
-
-### 4. Bias Detection (`verdict_engine.analysis.bias_detector`)
-
-Analyzes how sources with different political leans frame the claim vs. what research shows.
+### Bias Detection
 
 ```python
 from verdict_engine.analysis.bias_detector import analyze_source_bias
 
-bias = analyze_source_bias(claim, research_summary, sources)
-print(bias["bias_vs_accuracy"])
+bias = analyze_source_bias(
+    claim="Masks prevent COVID transmission",
+    research_summary="...",
+    sources=[{"outlet": "NYT", "lean": "left-center", "framing": "..."}],
+)
+# bias["bias_vs_accuracy"]           → analysis string
+# bias["framing_bias_detected"]      → bool
+# bias["political_influence_on_score"] → bool
 ```
 
-### 5. Content Analysis (`verdict_engine.analysis.content_analyzer`)
-
-Extract claims from images (Claude Vision) and videos (Gemini Files API):
+### Content Analysis (images + video)
 
 ```python
 from verdict_engine.analysis.content_analyzer import analyze_content
 
+# Extract claim from screenshot or photo
 result = analyze_content("screenshot.png", "image")
-print(result["claim_text"])
+print(result["claim_text"])   # extracted verifiable claim
+print(result["confidence"])   # 0–100
 
-result = analyze_content("tiktok.mp4", "video")
-print(result["claims"])
+# Extract claims from TikTok/YouTube/MP4
+result = analyze_content("clip.mp4", "video")
+print(result["claims"])       # list of verifiable claims
+print(result["raw_transcript"])
 ```
+
+---
 
 ## VerdictResult Fields
 
@@ -133,11 +193,12 @@ print(result["claims"])
 @dataclass
 class VerdictResult:
     claim_text: str
-    verdict_score: int              # 0-100
-    confidence_level: int           # 0-100
-    verdict_category: str           # established_consensus | crystallizing | emerging | speculative | contradicted | unverifiable
+    verdict_score: int              # 0–100 blended score
+    confidence_level: int           # 0–100 data confidence
+    verdict_category: str           # established_consensus | crystallizing | emerging
+                                    # speculative | contradicted | unverifiable
     research_maturity: str          # established | crystallizing | emerging | speculative
-    research_summary: str
+    research_summary: str           # 2–3 sentence synthesis
     key_findings: List[str]
     limitations: str
     is_emerging_field: bool
@@ -149,41 +210,60 @@ class VerdictResult:
     political_lean_aggregate: dict
     bias_analysis: str
     political_influence_detected: bool
-    score_calculation_breakdown: dict
+    score_calculation_breakdown: dict   # full audit trail
     studies_included_count: int
     source_selection_reasoning: str
-    sources: List[dict]
+    sources: List[dict]             # pmid, title, journal, year, url, study_type
 ```
 
-## Verdict Score Interpretation
+---
 
-| Score | Meaning |
-|---|---|
-| 90-100 | Overwhelming consensus across meta-analyses |
-| 70-89 | Strong consensus with minor caveats |
-| 50-69 | Mixed evidence or emerging field |
-| 30-49 | Contradicted by majority of research |
-| 0-29 | False or clearly misleading |
+## Contributing
 
-## Architecture
+Contributions are welcome. Here's where the highest-value work is:
 
+**Research sources** — add new peer-reviewed databases in `verdict_engine/research/multi_source.py`. Each source is one function returning `List[ResearchPaper]`. The parallel executor picks it up automatically.
+
+**Quality scoring** — improve the rubric in `verdict_engine/synthesis/verdict_scorer.py`. The 6-dimension weights are clearly documented and easy to adjust.
+
+**Expert consensus** — `verdict_engine/research/expert_consensus.py` is intentionally minimal. There's a clear extension point for integrating domain expert databases.
+
+**Bias detection** — expand outlet lean coverage in `verdict_engine/analysis/bias_detector.py`.
+
+### Setup
+
+```bash
+git clone https://github.com/King3lu/verdict-engine.git
+cd verdict-engine
+pip install -e .
+
+export ANTHROPIC_API_KEY=sk-ant-...
+python -c "from verdict_engine import run_verdict_pipeline; print(run_verdict_pipeline('Coffee is good for you').verdict_score)"
 ```
-verdict_engine/
-├── pipeline.py          # Orchestrates the full 6-step pipeline
-├── models.py            # Core data structures
-├── research/
-│   ├── multi_source.py  # Parallel search across 4 peer-reviewed DBs
-│   ├── government_sources.py  # WHO, CDC, NIH
-│   └── expert_consensus.py   # Expert aggregation (extensible)
-├── synthesis/
-│   ├── claude_service.py  # Primary + secondary Claude validation
-│   └── verdict_scorer.py  # Quality scoring rubric
-└── analysis/
-    ├── bias_detector.py   # Source framing bias analysis
-    ├── source_quality.py  # Quality constants and helpers
-    └── content_analyzer.py  # Image/video claim extraction
-```
+
+### Guidelines
+
+- Keep `verdict_engine/` free of database dependencies — the package must return pure Python objects
+- Every new research source should fail gracefully (never crash the pipeline)
+- Scoring changes should be justified with references to methodology literature
+- Open an issue before large refactors
+
+---
+
+## Reference Implementation
+
+**[Tru 3lu](https://github.com/King3lu/tru3lu)** is the platform built on top of verdict-engine. It adds:
+- FastAPI backend with verdict persistence (SQLAlchemy)
+- Community feed, social posts, likes, comments, follows
+- Expert crowdsourcing + outreach
+- Article discovery via Gemini
+- Dispute system with audit trails
+- Outlet bias registry (AllSides + Ad Fontes)
+
+verdict-engine handles the science. Tru 3lu handles the platform.
+
+---
 
 ## License
 
-Apache 2.0 — free to use, audit, contribute.
+Apache 2.0 — free to use, audit, fork, and build on.
