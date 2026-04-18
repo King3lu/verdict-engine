@@ -3,6 +3,7 @@ Verdict pipeline orchestrator.
 Runs the full 6-step fact-verification pipeline and returns a VerdictResult.
 No database dependency — pure Python in, pure Python out.
 """
+import logging
 from datetime import datetime
 from typing import List, Optional
 
@@ -11,6 +12,8 @@ from .research.multi_source import search_all_sources
 from .synthesis.claude_service import synthesize_verdict, validate_verdict
 from .synthesis.verdict_scorer import score_study, calculate_verdict_score, classify_research_maturity
 from .analysis.bias_detector import analyze_source_bias
+
+log = logging.getLogger("verdict_engine.pipeline")
 
 
 def _score_papers(papers: List[ResearchPaper]) -> tuple[List[int], int, int]:
@@ -47,23 +50,30 @@ def _score_papers(papers: List[ResearchPaper]) -> tuple[List[int], int, int]:
 def run_verdict_pipeline(
     claim_text: str,
     article_bias_sources: Optional[List[dict]] = None,
+    category: Optional[str] = None,
 ) -> VerdictResult:
     """
     Full 6-step verdict pipeline. Returns VerdictResult with no database side effects.
 
     article_bias_sources: optional list of {outlet, lean, framing} dicts from article discovery.
+    category: claim category hint (e.g. "health") used to improve research source filtering.
     """
-    # 1. Research
-    bundle = search_all_sources(claim_text)
+    # 1. Research — always a fresh search, no caching
+    log.info("[pipeline] step 1/6 research  claim=%r category=%r", claim_text, category)
+    bundle = search_all_sources(claim_text, category=category)
     papers = bundle.papers
+    log.info("[pipeline] step 1/6 done  papers=%d source_counts=%s",
+             len(papers), bundle.source_counts)
 
     # 2. Score paper quality
     quality_scores, avg_recency, _ = _score_papers(papers)
 
     # 3. Primary synthesis
+    log.info("[pipeline] step 3/6 synthesis  papers_to_claude=%d", min(len(papers), 8))
     synthesis = synthesize_verdict(claim_text, papers)
 
     # 4. Independent validation
+    log.info("[pipeline] step 4/6 validation  raw_score=%s", synthesis.get("verdict_score"))
     audit = validate_verdict(claim_text, synthesis, papers)
 
     raw_score = synthesis.get("verdict_score", 50)

@@ -27,6 +27,111 @@ REQUEST_HEADERS = {
 
 NCBI_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 
+_HEALTH_KEYWORDS = {
+    "vaccine", "vaccination", "drug", "medication", "treatment", "therapy",
+    "clinical", "trial", "placebo", "randomized", "randomised", "cohort",
+    "cancer", "tumor", "carcinoma", "diabetes", "insulin", "hiv", "aids",
+    "covid", "sars", "influenza", "infection", "virus", "bacteria", "pathogen",
+    "disease", "syndrome", "disorder", "symptom", "diagnosis", "prognosis",
+    "surgery", "hospital", "patient", "mortality", "morbidity", "dose",
+    "efficacy", "safety", "adverse", "protein", "gene", "dna", "rna",
+    "cell", "immune", "antibody", "antigen", "mutation", "genome",
+    "diet", "nutrition", "supplement", "vitamin", "mineral", "obesity",
+    "depression", "anxiety", "alzheimer", "dementia", "autism", "adhd",
+    "blood", "heart", "lung", "liver", "kidney", "brain", "neuron",
+    "lenacapavir", "mrna", "monoclonal", "antibiotic", "antiviral",
+}
+
+_PHYSICS_KEYWORDS = {
+    "quark", "boson", "higgs", "lepton", "fermion", "hadron",
+    "gravitational wave", "black hole", "neutron star", "pulsar",
+    "dark matter", "dark energy", "cosmological", "cosmology",
+    "quantum field", "particle physics", "collider", "accelerator",
+    "exoplanet", "galaxy", "nebula", "telescope", "astrophysics",
+}
+
+_HEALTH_CATEGORIES = {"health", "nutrition", "medicine", "science"}
+
+# MeSH term mappings for common health concepts
+_MESH_MAP: dict[str, str] = {
+    "hiv": "HIV Infections[MeSH Terms]",
+    "aids": "Acquired Immunodeficiency Syndrome[MeSH Terms]",
+    "covid": "COVID-19[MeSH Terms]",
+    "sars": "SARS-CoV-2[MeSH Terms]",
+    "influenza": "Influenza, Human[MeSH Terms]",
+    "vaccine": "Vaccines[MeSH Terms]",
+    "vaccination": "Vaccination[MeSH Terms]",
+    "cancer": "Neoplasms[MeSH Terms]",
+    "tumor": "Neoplasms[MeSH Terms]",
+    "diabetes": "Diabetes Mellitus[MeSH Terms]",
+    "insulin": "Insulin[MeSH Terms]",
+    "depression": "Depression[MeSH Terms]",
+    "alzheimer": "Alzheimer Disease[MeSH Terms]",
+    "dementia": "Dementia[MeSH Terms]",
+    "antibiotic": "Anti-Bacterial Agents[MeSH Terms]",
+    "antiviral": "Antiviral Agents[MeSH Terms]",
+    "mrna": "RNA, Messenger[MeSH Terms]",
+    "obesity": "Obesity[MeSH Terms]",
+    "hypertension": "Hypertension[MeSH Terms]",
+    "clinical trial": "Clinical Trials as Topic[MeSH Terms]",
+    "gene therapy": "Genetic Therapy[MeSH Terms]",
+}
+
+# Drug/compound names with PubMed Supplementary Concept entries
+_SUPPLEMENTARY_CONCEPTS: set[str] = {
+    "lenacapavir", "remdesivir", "molnupiravir", "nirmatrelvir",
+    "dolutegravir", "cabotegravir", "bictegravir", "darunavir",
+    "semaglutide", "tirzepatide", "ozempic", "wegovy",
+    "paxlovid", "metformin", "atorvastatin",
+}
+
+# Title/abstract terms that signal off-topic physics/astronomy papers
+_OFFSITE_EXCLUSION = (
+    'NOT (quark[Title/Abstract] OR boson[Title/Abstract] OR '
+    '"dark matter"[Title/Abstract] OR astrophysics[Title/Abstract] OR '
+    'cosmology[Title/Abstract] OR "particle physics"[Title/Abstract] OR '
+    'neutron[Title/Abstract] OR "gravitational wave"[Title/Abstract])'
+)
+
+
+def _build_pubmed_query(claim: str, category: str | None = None) -> str:
+    """Build a PubMed search query with domain filters to prevent cross-domain pollution."""
+    claim_lower = claim.lower()
+    words = set(claim_lower.split())
+
+    is_health_category = bool(category and category.lower() in _HEALTH_CATEGORIES)
+    has_health_keywords = bool(words & _HEALTH_KEYWORDS) or any(
+        kw in claim_lower for kw in _HEALTH_KEYWORDS if " " in kw
+    )
+    has_physics_keywords = any(kw in claim_lower for kw in _PHYSICS_KEYWORDS)
+
+    if not ((is_health_category or has_health_keywords) and not has_physics_keywords):
+        return claim
+
+    parts = [f"({claim})"]
+
+    # Anchor to MeSH terms detected in the claim — ensures papers are actually
+    # indexed under these medical concepts, not just containing the words
+    mesh_anchors = [mesh for kw, mesh in _MESH_MAP.items() if kw in claim_lower]
+    for drug in _SUPPLEMENTARY_CONCEPTS:
+        if drug in claim_lower:
+            mesh_anchors.append(f"{drug}[Supplementary Concept]")
+    if mesh_anchors:
+        # OR so we don't over-restrict when a claim spans multiple concepts
+        parts.append("AND (" + " OR ".join(mesh_anchors) + ")")
+
+    # Restrict to MEDLINE-indexed biomedical journals
+    parts.append("AND medline[sb]")
+
+    # Require human or animal subjects — definitively excludes physics/astronomy
+    if is_health_category or has_health_keywords:
+        parts.append("AND (humans[MeSH Terms] OR animals[MeSH Terms])")
+
+    # Belt-and-suspenders: block off-topic physics terms from appearing in titles
+    parts.append(_OFFSITE_EXCLUSION)
+
+    return " ".join(parts)
+
 
 # ---------------------------------------------------------------------------
 # Study type inference
@@ -65,13 +170,15 @@ def _ncbi_params(extra: dict) -> str:
     return urlencode(params)
 
 
-def search_pubmed(claim: str, max_results: int = 15) -> List[ResearchPaper]:
+def search_pubmed(claim: str, max_results: int = 15, category: str | None = None) -> List[ResearchPaper]:
     try:
+        pubmed_query = _build_pubmed_query(claim, category)
+        print(f"[verdict-engine] PubMed query: {pubmed_query!r}")
         search_url = (
             f"{NCBI_BASE}/esearch.fcgi?"
             + _ncbi_params({
                 "db": "pubmed",
-                "term": claim,
+                "term": pubmed_query,
                 "retmax": max_results,
                 "sort": "relevance",
                 "retmode": "json",
@@ -331,12 +438,12 @@ def _deduplicate(paper_results: Dict[str, List[ResearchPaper]]) -> List[Research
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def search_all_sources(claim: str) -> ResearchBundle:
+def search_all_sources(claim: str, category: str | None = None) -> ResearchBundle:
     """Search all configured sources in parallel. Source failures never crash the pipeline."""
     q = quote_plus(claim)
 
     paper_tasks = {
-        "pubmed":     lambda: search_pubmed(claim, max_results=15),
+        "pubmed":     lambda: search_pubmed(claim, max_results=15, category=category),
         "europe_pmc": lambda: _search_europe_pmc(q),
         "cochrane":   lambda: _search_cochrane(q),
         "arxiv":      lambda: _search_arxiv(q),
